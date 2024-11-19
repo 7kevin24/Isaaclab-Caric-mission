@@ -1,4 +1,5 @@
-﻿"""Launch Isaac Sim Simulator first."""
+﻿""""This script is retained for manually fine-tuning the quadcopter's position controller."""
+"""Launch Isaac Sim Simulator first."""
 
 import argparse
 import torch
@@ -122,8 +123,8 @@ class VelocityController:
 
 class PositionController:
     def __init__(self,device,gravity=9.81):
-        self.ax_pid = PIDController(kp=1.0, ki=0.09, kd=0.7, device=device, integral_limit=5.0)
-        self.ay_pid = PIDController(kp=1.0, ki=0.09, kd=0.7, device=device, integral_limit=5.0)  
+        self.ax_pid = PIDController(kp=5.1, ki=0.07, kd=4.0, device=device, integral_limit=5.0)
+        self.ay_pid = PIDController(kp=5.1, ki=0.07, kd=4.0, device=device, integral_limit=5.0)  
         self.device = device
         self.g = gravity
 
@@ -277,7 +278,7 @@ def main():
     # Simulate physics
     while simulation_app.is_running():
         # reset
-        if count % 1200 == 0:
+        if count % 3000 == 0:
             # reset counters
             sim_time = 0.0
             count = 0
@@ -321,6 +322,8 @@ def main():
         if position_loop_counter % (inner_loop_freq // position_loop_freq) == 0: # 200//20 = 10
             # Position control
             position_loop_counter = 0
+            # desired_position[0] += 0.1
+            # desired_position[1] += 0.1
             desired_velocity = pos_controller.control(
                 desired_position, current_pos, R_robot, sim_dt * (inner_loop_freq // position_loop_freq)
             )

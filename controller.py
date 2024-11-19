@@ -63,7 +63,8 @@ def QuaternionToRPY(quat: torch.Tensor) -> torch.Tensor:
 def RpyToQuaternion(rpy: torch.Tensor) -> torch.Tensor:
     """
     Convert roll, pitch, yaw angles to quaternions.
-
+        current_quat = self._robots[agent].data.root_quat_w
+        R_robot = QuaternionToRotationMatrix(current_quat)
     Args:
         rpy (torch.Tensor): Roll, pitch, yaw angles [batch_size, 3] or [3]
 
@@ -135,6 +136,11 @@ class PIDController:
             self.integral = torch.zeros_like(self.integral,device=self.device)
         if self.prev_error is not None:
             self.prev_error = torch.zeros_like(self.prev_error,device=self.device)
+
+    def reset(self):
+        """Reset the PID controller."""
+        self.integral = None
+        self.prev_error = None
 
 class Controller:
     """
@@ -245,6 +251,13 @@ class AttAltController(Controller):
 
         return total_thrust, moments
 
+    def clear_integral(self):
+        """Clear the integral terms of the PID controllers."""
+        self.roll_pid.clear_integral()
+        self.pitch_pid.clear_integral()
+        self.yaw_pid.clear_integral()
+        self.alt_pid.clear_integral()
+
 class VelocityController(Controller):
     """
     Velocity controller for a quadcopter.
@@ -303,6 +316,12 @@ class VelocityController(Controller):
         desired_attitude[:, 2] = 0.0  # Yaw
 
         return desired_attitude
+    
+    def clear_integral(self):
+        """Clear the integral terms of the PID controllers."""
+        self.ax_pid.clear_integral()
+        self.ay_pid.clear_integral()
+        self.az_pid.clear_integral()
 
 class PositionController(Controller):
     """
@@ -359,3 +378,8 @@ class PositionController(Controller):
         desired_velocity_b = torch.clamp(desired_velocity_b, -self.velocity_limit, self.velocity_limit)
 
         return desired_velocity_b
+    
+    def clear_integral(self):  
+        """Clear the integral terms of the PID controllers."""
+        self.ax_pid.clear_integral()
+        self.ay_pid.clear_integral()

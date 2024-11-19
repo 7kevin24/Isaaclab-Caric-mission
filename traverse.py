@@ -1,4 +1,8 @@
-﻿from __future__ import annotations
+﻿"""
+This Env defines a UAVs Traversal environment where multiple UAVs are tasked to traverse a cubic area.
+"""
+
+from __future__ import annotations
 from omni.isaac.lab.assets import Articulation, ArticulationCfg
 from omni.isaac.lab.envs import DirectMARLEnv, DirectMARLEnvCfg
 from omni.isaac.lab.envs.common import AgentID
@@ -16,7 +20,7 @@ from omni.isaac.lab_assets import CRAZYFLIE_CFG  # isort: skip
 from omni.isaac.lab.markers import CUBOID_MARKER_CFG  # isort: skip
 
 import torch
-from .controller import AttAltController, PositionController, VelocityController,QuaternionToRPY,QuaternionToRotationMatrix
+from .controller import AttAltController, PositionController, VelocityController, QuaternionToRPY, QuaternionToRotationMatrix
 
 # Import controllers from controller.py
 
@@ -26,18 +30,40 @@ class UAVsTraversalEnvCfg(DirectMARLEnvCfg):
     episode_length_s = 20.0
     decimation = 5  # Inner loop frequency is 5 times the outer loop
 
+    # Area bounds
+    area_bounds = {
+        "min": [-2.0, -2.0, 1],
+        "max": [2.0, 2.0, 5.0]
+    }
+    area_size = (
+        (area_bounds["max"][0] - area_bounds["min"][0]),
+        (area_bounds["max"][1] - area_bounds["min"][1]),
+        (area_bounds["max"][2] - area_bounds["min"][2]),
+    )
+
+    # Grid map settings
+    grid_resolution = 1.0  # size of each grid cell
+    grid_size = (
+        int(area_size[0] / grid_resolution),
+        int(area_size[1] / grid_resolution),
+        int(area_size[2] / grid_resolution),
+    )
+
     # Agent settings
     num_agents: int = 2
     possible_agents = [f"agent_{i}" for i in range(num_agents)]
 
-    # Action and observation spaces
-    action_spaces = {agent: 4 for agent in possible_agents}
-    observation_spaces = {agent: 12 for agent in possible_agents}
-    state_space = num_agents * 12
+    # Action Space: [x,y,z] shape:3
+    action_spaces = {agent: 3 for agent in possible_agents}
+    # Observation Space: [position_w, other_agents_pos, grid_map_flat]
+    obs_shape = 3 * num_agents + grid_size[0]*grid_size[1]*grid_size[2]
+    observation_spaces = {agent: 70 for agent in possible_agents}
+
+    state_space = obs_shape
 
     # Simulation settings
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 100,
+        dt=0.005,
         render_interval=decimation,
         disable_contact_processing=True,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -76,6 +102,7 @@ class UAVsTraversalEnvCfg(DirectMARLEnvCfg):
     # Reward scales
     distance_reward_scale = 1.0
     collision_penalty = -10.0
+    visit_reward_scale = 1.0  # Added reward scale for visiting new grid cells
 
     # Robot configuration
     robot = {
@@ -83,12 +110,13 @@ class UAVsTraversalEnvCfg(DirectMARLEnvCfg):
             prim_path=f"/World/envs/env_.*/Robot_{agent}"
         ).replace(
             init_state=ArticulationCfg.InitialStateCfg(
-                pos=(0.0, 0.0, 1.0*count),
+                pos=(0.0, 0.0, 1.0 * (count + 1)),
                 rot=(1.0, 0.0, 0.0, 0.0),
             )
         )
         for agent, count in zip(possible_agents, range(num_agents))
     }
+
 
 class UAVsTraversalEnv(DirectMARLEnv):
     cfg: UAVsTraversalEnvCfg
@@ -99,11 +127,25 @@ class UAVsTraversalEnv(DirectMARLEnv):
 
         # Define the cubic area using two vertices
         self.area_bounds = {
-        "min": torch.tensor([-10.0, -10.0, 0.5],device=self.device),
-        "max": torch.tensor([10.0, 10.0, 5.0],device=self.device),
+            "min": torch.tensor(cfg.area_bounds["min"], device=self.device),
+            "max": torch.tensor(cfg.area_bounds["max"], device=self.device),
         }
+        self.area_size = torch.tensor(cfg.area_size, device=self.device)
+        self.grid_resolution = cfg.grid_resolution
+        self.grid_size = cfg.grid_size
+
+        # Initialize grid maps for each environment
+        self.grid_map = torch.zeros(
+            self.num_envs,
+            self.grid_size[0],
+            self.grid_size[1],
+            self.grid_size[2],
+            device=self.device,
+        )
 
         # Initialize controllers
+        self.desired_attitude = torch.zeros(self.num_envs, 3, device=self.device)
+        self.desired_altitude = torch.ones(self.num_envs, device=self.device) * 1.0
         self.controllers = {}
         self.dt = self.sim.get_physics_dt()
         for agent in self.possible_agents:
@@ -112,24 +154,21 @@ class UAVsTraversalEnv(DirectMARLEnv):
                 "velocity": VelocityController(device=self.device),
                 "attitude": AttAltController(
                     robot_mass=self._robots[agent].root_physx_view.get_masses()[0].sum(),
-                    J=torch.tensor([
-                        [2.1066e-05, 0.0, 0.0],
-                        [0.0, 2.1810e-05, 0.0],
-                        [0.0, 0.0, 3.6084e-05]
-                    ], device=self.device),
-                    device=self.device
+                    J=torch.tensor(
+                        [
+                            [2.1066e-05, 0.0, 0.0],
+                            [0.0, 2.1810e-05, 0.0],
+                            [0.0, 0.0, 3.6084e-05],
+                        ],
+                        device=self.device,
+                    ),
+                    device=self.device,
                 ),
             }
 
         # Initialize action tensors
         self._actions = {
             agent: torch.zeros(self.num_envs, self.cfg.action_spaces[agent], device=self.device)
-            for agent in self.possible_agents
-        }
-
-        # Targets for traversal
-        self._waypoints = {
-            agent: torch.zeros(self.num_envs, 3, device=self.device)
             for agent in self.possible_agents
         }
 
@@ -146,14 +185,13 @@ class UAVsTraversalEnv(DirectMARLEnv):
             self._robot_weights[agent] = (self._robot_masses[agent] * gravity_norm).item()
 
     def _setup_scene(self):
-        """Set up the scene following Shadow Hand's approach."""
         # Create terrain first
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
         # Initialize robots dictionary
-        self._robots : dict[AgentID, Articulation] = {}
+        self._robots: dict[AgentID, Articulation] = {}
 
         # Create robots after terrain
         for agent, robot_cfg in self.cfg.robot.items():
@@ -182,19 +220,17 @@ class UAVsTraversalEnv(DirectMARLEnv):
             self._robots[agent].write_root_state_to_sim(default_state, env_ids)
 
             # Reset controllers
-            self.controllers[agent]["position"].ax_pid.clear_integral()
-            self.controllers[agent]["position"].ay_pid.clear_integral()
-            self.controllers[agent]["velocity"].ax_pid.clear_integral()
-            self.controllers[agent]["velocity"].ay_pid.clear_integral()
-            self.controllers[agent]["attitude"].roll_pid.clear_integral()
-            self.controllers[agent]["attitude"].pitch_pid.clear_integral()
-            self.controllers[agent]["attitude"].yaw_pid.clear_integral()
-            self.controllers[agent]["attitude"].alt_pid.clear_integral()
+            self.controllers[agent]["position"].clear_integral()
+            self.controllers[agent]["velocity"].clear_integral()
+            self.controllers[agent]["attitude"].clear_integral()
 
             # Set new waypoints within the area
-            self._waypoints[agent][env_ids] = torch.rand(len(env_ids), 3, device=self.device) * (
+            self._actions[agent][env_ids] = torch.rand(len(env_ids), 3, device=self.device) * (
                 self.area_bounds["max"] - self.area_bounds["min"]
             ) + self.area_bounds["min"]
+
+        # Reset grid map
+        self.grid_map[env_ids] = 0
 
         # Reset buffers
         self.reset_buf[env_ids] = 0
@@ -203,26 +239,29 @@ class UAVsTraversalEnv(DirectMARLEnv):
 
     def _pre_physics_step(self, actions):
         sim_dt = self.sim.get_physics_dt()
+
         # Outer loop: Position and Velocity Control
         for agent in self.possible_agents:
-            current_pos = self._robots[agent].data.root_pos_w
+            current_pos = self._robots[agent].data.root_pos_w - self.scene.env_origins
+            # print("current_pos", current_pos[0], current_pos[1], current_pos[2])
             current_vel = self._robots[agent].data.root_lin_vel_w
-            desired_pos = self._waypoints[agent]
-            # print the shape of current_pos
-            # print(current_pos.shape)
+            desired_pos = actions[agent][:, :3]
+            # generate random actions to test
+            desired_pos = torch.rand(len(desired_pos), 3, device=self.device) * (
+                self.area_bounds["max"] - self.area_bounds["min"]
+            ) + self.area_bounds["min"]
+            desired_pos = torch.clamp(desired_pos, self.area_bounds["min"], self.area_bounds["max"])
+            current_quat = self._robots[agent].data.root_quat_w
             # Position controller to compute desired velocity
             desired_vel = self.controllers[agent]["position"].control(
-                desired_pos, current_pos, self._robots[agent].data.root_quat_w, self.dt
+                desired_pos, current_pos,current_quat ,self.dt
             )
 
             # Velocity controller to compute desired attitude
-            desired_attitude = self.controllers[agent]["velocity"].control(
-                desired_vel, current_vel, self.dt
+            self.desired_attitude = self.controllers[agent]["velocity"].control(
+                desired_vel, current_vel,self.dt
             )
-
-            # Store desired attitude and altitude for the inner loop
-            self._actions[agent][:, :3] = desired_attitude
-            self._actions[agent][:, 3] = desired_pos[:, 2]
+            self.desired_altitude = desired_pos[:, 2]
 
     def _apply_action(self):
         # Inner loop: Attitude and Altitude Control
@@ -233,8 +272,8 @@ class UAVsTraversalEnv(DirectMARLEnv):
             R_robot = QuaternionToRotationMatrix(current_quat)
 
             total_thrust, moments = self.controllers[agent]["attitude"].control(
-                desired_attitude=self._actions[agent][:, :3],
-                desired_altitude=self._actions[agent][:, 3],
+                desired_attitude=self.desired_attitude,
+                desired_altitude=self.desired_altitude,
                 current_attitude=current_attitude,
                 current_altitude=current_altitude,
                 R_robot=R_robot,
@@ -253,31 +292,72 @@ class UAVsTraversalEnv(DirectMARLEnv):
     def _get_rewards(self):
         rewards = {}
         for agent in self.possible_agents:
-            distance = torch.norm(
-                self._waypoints[agent] - self._robots[agent].data.root_pos_w, dim=1
+            current_pos = self._robots[agent].data.root_pos_w - self.scene.env_origins
+            desired_pos = self._actions[agent][:, :3]
+            distance = torch.norm(desired_pos - current_pos, dim=-1)
+            progress_reward = -distance * self.cfg.distance_reward_scale
+
+            # Collision penalty (if any) TODO: collision detection
+            # collision = self._robots[agent].data.contact_forces.norm(dim=-1) > 0.0
+            # collision_penalty = collision.float() * self.cfg.collision_penalty
+            collision_penalty = 0.0 
+            # Compute whether agent has visited a new grid cell
+            grid_idx = ((current_pos - self.area_bounds["min"]) / self.grid_resolution).long()
+            max_grid_idx = torch.tensor(self.grid_size, device=self.device, dtype=torch.long) - 1
+            
+            grid_idx = torch.maximum(
+                torch.minimum(grid_idx, max_grid_idx.unsqueeze(0).expand(self.num_envs, -1)), 
+                torch.zeros_like(grid_idx)
             )
-            rewards[agent] = -self.cfg.distance_reward_scale * distance
+            env_indices = torch.arange(self.num_envs, device=self.device)
+
+            prior_grid_values = self.grid_map[env_indices, grid_idx[:,0], grid_idx[:,1], grid_idx[:,2]]
+
+            visit_reward = (1 - prior_grid_values.float()) * self.cfg.visit_reward_scale
+
+            # Update the grid map to mark these positions as visited
+            self.grid_map[env_indices, grid_idx[:,0], grid_idx[:,1], grid_idx[:,2]] = 1
+
+            # Total reward
+            rewards[agent] = progress_reward + collision_penalty + visit_reward
         return rewards
 
     def _get_dones(self):
         terminated = {}
+        truncated = {}
         for agent in self.possible_agents:
-            pos = self._robots[agent].data.root_pos_w
-            out_of_bounds = torch.any(
-                (pos < self.area_bounds["min"]) | (pos > self.area_bounds["max"]), dim=1
-            )
-            terminated[agent] = out_of_bounds | (self.episode_length_buf >= self.max_episode_length)
-        return terminated, {}
+            current_pos = self._robots[agent].data.root_pos_w - self.scene.env_origins
+            out_of_bounds = (
+                (current_pos < self.area_bounds["min"]) | (current_pos > self.area_bounds["max"])
+            ).any(dim=-1)
+            # TODO: Collision Detection
+            # collision = self._robots[agent].data.contact_forces.norm(dim=-1) > 0.0
+            collision = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+            max_episode_length = self.episode_length_buf >= self.max_episode_length
+
+            terminated[agent] = out_of_bounds | collision
+            truncated[agent] = max_episode_length
+            self.reset_buf = terminated[agent] | truncated[agent]
+        return terminated, truncated
 
     def _get_observations(self):
         observations = {}
         for agent in self.possible_agents:
             robot = self._robots[agent]
-            obs = torch.cat([
-                robot.data.root_lin_vel_b,
-                robot.data.root_ang_vel_b,
-                robot.data.projected_gravity_b,
-                robot.data.root_pos_w - self._waypoints[agent],
-            ], dim=-1)
+            own_pos = robot.data.root_pos_w - self.scene.env_origins
+            # own_vel = robot.data.root_lin_vel_w
+
+            # Other agents' positions
+            other_agents_pos = []
+            for other_agent in self.possible_agents:
+                if other_agent != agent:
+                    other_pos = self._robots[other_agent].data.root_pos_w - self.scene.env_origins
+                    other_agents_pos.append(other_pos)
+            other_agents_pos = torch.cat(other_agents_pos, dim=-1) if other_agents_pos else torch.zeros_like(own_pos)
+
+            # Flatten grid map
+            grid_map_flat = self.grid_map.view(self.num_envs, -1)
+
+            obs = torch.cat([own_pos, other_agents_pos, grid_map_flat], dim=-1)
             observations[agent] = obs
         return observations
